@@ -1,0 +1,28 @@
+# Chained conflist. Cilium copies it to /etc/cni/net.d/05-cilium.conflist
+# when cni.customConf=true and cni.configMap=cni-configuration.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cni-configuration
+  namespace: kube-system
+data:
+  cni-config: |-
+    {
+      "cniVersion": "1.0.0",
+      "name": "cilium",
+      "plugins": [
+        {
+          "type": "cilium-cni",
+          "enable-debug": false,
+          "log-file": "/var/run/cilium/cilium-cni.log"
+        },
+        {
+          "type": "cilium-clat",
+          "clatPrefix": "64:ff9b:1::/96",
+          "podIPv4": "192.0.0.2/29",
+          "gatewayIPv4": "192.0.0.1",
+          "excludeNamespaces": ["kube-system"],
+          "logFile": "/var/log/cilium-clat.log"
+        }
+      ]
+    }

@@ -1,0 +1,9 @@
+# Helm values for Cilium to use the chained conflist from cni-configuration.yaml.
+# Merge into the existing values; only the cni block is new.
+cni:
+  customConf: true
+  configMap: cni-configuration
+  exclusive: true
+# Phase 1 needs the veth datapath (the default). netkit is not supported.
+bpf:
+  datapathMode: veth

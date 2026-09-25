@@ -1,0 +1,73 @@
+# Installer DaemonSet: copies the cilium-clat binary into /opt/cni/bin on every
+# node. Cilium writes the chained conflist itself from the cni-configuration
+# ConfigMap (see cilium-values.yaml), so this only ships the binary.
+#
+# The copy is atomic: write to a temporary name, then rename(2). The runtime
+# never executes a partial binary.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: cilium-clat
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: cilium-clat
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cilium-clat
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 100%
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cilium-clat
+    spec:
+      # Must not depend on the CNI it installs.
+      hostNetwork: true
+      priorityClassName: system-node-critical
+      tolerations:
+        - operator: Exists
+      initContainers:
+        - name: install
+          image: ghcr.io/andreabedini/cilium-clat:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -ec
+            - |
+              cp /cilium-clat /host/opt/cni/bin/.cilium-clat.tmp
+              chmod 0755 /host/opt/cni/bin/.cilium-clat.tmp
+              mv -f /host/opt/cni/bin/.cilium-clat.tmp /host/opt/cni/bin/cilium-clat
+              echo "installed $(/cilium-clat --version 2>/dev/null || echo cilium-clat)"
+          securityContext:
+            privileged: false
+            runAsUser: 0
+          volumeMounts:
+            - name: cni-bin
+              mountPath: /host/opt/cni/bin
+      containers:
+        - name: sleep
+          image: ghcr.io/andreabedini/cilium-clat:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-c", "trap 'exit 0' TERM; while true; do sleep 3600 & wait $!; done"]
+          resources:
+            requests:
+              cpu: 1m
+              memory: 8Mi
+            limits:
+              memory: 32Mi
+          securityContext:
+            runAsUser: 65534
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: cni-bin
+          hostPath:
+            # Talos: /opt/cni/bin is on the ephemeral overlay and survives
+            # reboots only when /opt is persisted. See DESIGN.md, boot ordering.
+            path: /opt/cni/bin
+            type: DirectoryOrCreate
