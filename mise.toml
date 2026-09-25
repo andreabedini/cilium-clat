@@ -6,7 +6,8 @@ ko = "latest"
 
 [env]
 CGO_ENABLED = "0"
-KO_DOCKER_REPO = "ghcr.io/andreabedini"
+# With --bare, ko names the image exactly KO_DOCKER_REPO.
+KO_DOCKER_REPO = "ghcr.io/andreabedini/cilium-clat"
 
 [tasks.build]
 description = "Static plugin binary in bin/"
@@ -49,7 +50,7 @@ run = 'ko build --bare --platform=linux/amd64,linux/arm64 --tags="${IMAGE_TAGS:-
 
 [tasks.image-local]
 description = "Build into the local Docker daemon as ko.local/cilium-clat"
-env = { KO_DOCKER_REPO = "ko.local" }
+env = { KO_DOCKER_REPO = "ko.local/cilium-clat" }
 run = "ko build --bare --platform=linux/amd64 ./cmd/cilium-clat"
 
 [tasks.clean]
