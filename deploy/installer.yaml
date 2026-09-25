@@ -2,8 +2,9 @@
 # node. Cilium writes the chained conflist itself from the cni-configuration
 # ConfigMap (see cilium-values.yaml), so this only ships the binary.
 #
-# The copy is atomic: write to a temporary name, then rename(2). The runtime
-# never executes a partial binary.
+# The image is built with ko and has no shell: the binary installs itself
+# (`cilium-clat install`) with a write to a temporary name and a rename(2), so
+# the runtime never executes a partial binary.
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -33,14 +34,7 @@ spec:
         - name: install
           image: ghcr.io/andreabedini/cilium-clat:latest
           imagePullPolicy: IfNotPresent
-          command:
-            - /bin/sh
-            - -ec
-            - |
-              cp /cilium-clat /host/opt/cni/bin/.cilium-clat.tmp
-              chmod 0755 /host/opt/cni/bin/.cilium-clat.tmp
-              mv -f /host/opt/cni/bin/.cilium-clat.tmp /host/opt/cni/bin/cilium-clat
-              echo "installed $(/cilium-clat --version 2>/dev/null || echo cilium-clat)"
+          args: ["install", "--dir", "/host/opt/cni/bin"]
           securityContext:
             privileged: false
             runAsUser: 0
@@ -51,7 +45,7 @@ spec:
         - name: sleep
           image: ghcr.io/andreabedini/cilium-clat:latest
           imagePullPolicy: IfNotPresent
-          command: ["/bin/sh", "-c", "trap 'exit 0' TERM; while true; do sleep 3600 & wait $!; done"]
+          args: ["sleep"]
           resources:
             requests:
               cpu: 1m

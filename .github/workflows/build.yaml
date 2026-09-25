@@ -1,0 +1,91 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: vet, unit tests, build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - run: mise run ci
+
+  test-bpf:
+    # Runners have passwordless sudo and a recent kernel: run the verifier
+    # and the BPF_PROG_TEST_RUN packet suite for real.
+    name: BPF tests (verifier + packets)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - name: Kernel
+        run: uname -r
+      - run: mise run test-bpf
+
+  test-netns:
+    name: netns integration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - name: Tools
+        run: sudo apt-get update -q && sudo apt-get install -y -q iproute2 iputils-ping iputils-tracepath curl python3
+      - run: mise run test-netns
+
+  generate-check:
+    # The BPF object is committed. Make sure it still compiles from source
+    # with the pinned flags; byte-identical output across clang versions is
+    # not expected, so only the build and the Go bindings are checked.
+    name: BPF object compiles
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - run: sudo apt-get update -q && sudo apt-get install -y -q clang llvm
+      - run: mise run generate
+      - name: Report drift
+        run: |
+          if ! git diff --quiet -- internal/clat/clat_bpfel.go; then
+            echo "::error::generated Go bindings differ from the committed ones; run 'mise run generate' and commit"
+            git diff -- internal/clat/clat_bpfel.go
+            exit 1
+          fi
+
+  image:
+    name: Container image (ko)
+    needs: [test, test-bpf]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | mise exec -- ko login ghcr.io --username "${{ github.actor }}" --password-stdin
+      - name: Tags
+        id: tags
+        run: |
+          tags="sha-${GITHUB_SHA}"
+          case "$GITHUB_REF" in
+            refs/tags/v*) tags="$tags,${GITHUB_REF#refs/tags/v},latest" ;;
+            refs/heads/main) tags="$tags,main,latest" ;;
+          esac
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+      - name: Build only (pull request)
+        if: github.event_name == 'pull_request'
+        run: mise exec -- ko build --bare --push=false --platform=linux/amd64,linux/arm64 ./cmd/cilium-clat
+      - name: Build and push
+        if: github.event_name != 'pull_request'
+        env:
+          IMAGE_TAGS: ${{ steps.tags.outputs.tags }}
+        run: mise run image

@@ -1,0 +1,16 @@
+# ko configuration. Build with:
+#   KO_DOCKER_REPO=ghcr.io/andreabedini ko build --bare --platform=linux/amd64,linux/arm64 ./cmd/cilium-clat
+# --bare makes the image name exactly $KO_DOCKER_REPO/cilium-clat.
+defaultBaseImage: cgr.dev/chainguard/static:latest
+defaultPlatforms:
+  - linux/amd64
+  - linux/arm64
+builds:
+  - id: cilium-clat
+    main: ./cmd/cilium-clat
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w

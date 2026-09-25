@@ -49,7 +49,7 @@ WORK="$(mktemp -d)"
 
 [ "$(id -u)" -eq 0 ] || fail "run as root"
 if [ "$NO_CLAT" -eq 0 ]; then
-	[ -x "$BIN" ] || fail "plugin binary $BIN not found, run make first"
+	[ -x "$BIN" ] || fail "plugin binary $BIN not found, run: mise run build"
 fi
 
 log "topology"

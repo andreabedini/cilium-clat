@@ -1,0 +1,56 @@
+# Tools and tasks. `mise install` fetches Go and ko; clang comes from the
+# system (only needed for `mise run generate`).
+[tools]
+go = "1.26"
+ko = "latest"
+
+[env]
+CGO_ENABLED = "0"
+KO_DOCKER_REPO = "ghcr.io/andreabedini"
+
+[tasks.build]
+description = "Static plugin binary in bin/"
+run = "go build -trimpath -ldflags '-s -w' -o bin/cilium-clat ./cmd/cilium-clat"
+sources = ["cmd/**/*.go", "internal/**/*.go", "internal/clat/clat_bpfel.o", "go.mod", "go.sum"]
+outputs = ["bin/cilium-clat"]
+
+[tasks.generate]
+description = "Recompile bpf/clat.c with clang via bpf2go (commit the output)"
+run = "go generate ./internal/clat/"
+
+[tasks.vet]
+description = "go vet and gofmt check"
+run = [
+  "go vet ./...",
+  "test -z \"$(gofmt -l cmd internal)\" || { gofmt -l cmd internal; echo 'gofmt: files need formatting'; exit 1; }",
+]
+
+[tasks.test]
+description = "Unit tests; the BPF tests skip without root"
+run = "go test ./..."
+
+[tasks.test-bpf]
+description = "As root: kernel verifier + BPF_PROG_TEST_RUN packet oracle"
+# $(command -v go) resolves through mise before sudo drops the PATH.
+run = 'sudo --preserve-env=HOME,PATH,GOPATH,GOMODCACHE,GOFLAGS,GOCACHE "$(command -v go)" test -v -run "Egress|Ingress|RoundTrip" ./internal/clat/'
+
+[tasks.test-netns]
+description = "As root: three-namespace integration test (pod, node, server)"
+depends = ["build"]
+run = 'sudo BIN="$PWD/bin/cilium-clat" hack/netns-test.sh'
+
+[tasks.ci]
+description = "What CI runs without root"
+depends = ["vet", "test", "build"]
+
+[tasks.image]
+description = "Build and push ghcr.io/andreabedini/cilium-clat with ko (IMAGE_TAGS=latest)"
+run = 'ko build --bare --platform=linux/amd64,linux/arm64 --tags="${IMAGE_TAGS:-latest}" ./cmd/cilium-clat'
+
+[tasks.image-local]
+description = "Build into the local Docker daemon as ko.local/cilium-clat"
+env = { KO_DOCKER_REPO = "ko.local" }
+run = "ko build --bare --platform=linux/amd64 ./cmd/cilium-clat"
+
+[tasks.clean]
+run = "rm -rf bin"

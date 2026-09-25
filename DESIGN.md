@@ -2,6 +2,12 @@
 
 Sep 25, 2026 · @Andrea Bedini
 
+Status: implemented in this repository. Both BPF programs pass the kernel
+verifier, the `BPF_PROG_TEST_RUN` packet suite (24 cases) and the
+three-namespace integration test in `hack/netns-test.sh` pass. Sections
+below that changed during implementation are marked *(implementation note)*.
+Not yet tested under Cilium; see [Test and validation plan](#test-and-validation-plan).
+
 ## Context and goals
 
 Decision: replace the per-pod CLAT sidecars with a chained CNI plugin, `cilium-clat`. The plugin attaches a stateless eBPF CLAT (RFC 6877, RFC 7915) to the pod-side `eth0`. Cilium stays unmodified.
@@ -32,7 +38,7 @@ The system has four components. Only the router PLAT exists today.
 | --- | --- | --- | --- |
 | `cilium-clat` CNI plugin | Static Go binary, BPF object embedded with `bpf2go` | Host, called by the container runtime | Per CNI call |
 | CLAT BPF programs | `clat_egress`, `clat_ingress` on clsact | Pod netns, pod-side `eth0` | Pod netns |
-| Installer | DaemonSet, init container copies binary and conflist | Every node | Node |
+| Installer | DaemonSet, init container runs `cilium-clat install` (image built with ko, no shell) | Every node | Node |
 | PLAT | Stateless or stateful NAT64 | Router | Permanent |
 
 ```mermaid
@@ -59,6 +65,7 @@ The CLAT maps one IPv4 host to the pod's own IPv6 address. Destinations map into
 | Egress | Destination | `a.b.c.d` | `P::a.b.c.d` (RFC 6052, /96) |
 | Ingress (clsact ingress, pod `eth0`) | Source | `P::a.b.c.d` | `a.b.c.d` |
 | Ingress | Destination | Pod IPv6 address | `192.0.0.2` |
+| Ingress, ICMPv6 error from a router | Source | Router address, not in `P` | `192.0.0.8` (RFC 7335 dummy) |
 
 ```mermaid
 sequenceDiagram
@@ -74,7 +81,9 @@ sequenceDiagram
     CLAT-->>App: IPv4 a.b.c.d to 192.0.0.2
 ```
 
-Ingress translation matches only packets whose source is inside `P` and whose destination is the pod address. All other IPv6 traffic passes untouched. This match rule is the reason `P` must not overlap the DNS64 prefix.
+Ingress translation matches packets whose destination is the pod address and whose source is inside `P`. All other IPv6 traffic passes untouched. This match rule is the reason `P` must not overlap the DNS64 prefix.
+
+*(implementation note)* One more class of packets is translated: ICMPv6 errors (Destination Unreachable, Packet Too Big, Time Exceeded, Parameter Problem) whose source is a router outside `P` but whose embedded packet is a CLAT flow, that is, from the pod IPv6 address to an address in `P`. Routers put their own address on errors, so without this rule no Packet Too Big would ever reach the IPv4 stack and PMTUD would fail. Following RFC 7915 section 5.2 and RFC 6791, such errors get the RFC 7335 IPv4 dummy address `192.0.0.8` as source (`errorSourceIPv4`). `traceroute -4` therefore shows `192.0.0.8` for every IPv6 hop. Native IPv6 errors, and errors quoting other flows, still pass untouched.
 
 ## Address and prefix plan
 
@@ -86,6 +95,7 @@ Recommendation: use a dedicated CLAT prefix `P = 64:ff9b:1::/96` from the RFC 82
 | IPv4 gateway | `192.0.0.1`, permanent neighbour entry | No ARP responder exists on the Cilium side in IPv6-only mode. |
 | CLAT source | Pod IPv6 address | Cilium anti-spoofing drops any other source. |
 | CLAT prefix `P` | `64:ff9b:1::/96` | Keeps CLAT return traffic apart from DNS64 traffic. |
+| ICMP error source | `192.0.0.8` | RFC 7335 dummy address for errors from routers outside `P`. |
 | DNS64 / PLAT prefix | `64:ff9b::/96` (current tayga) | Unchanged. |
 
 ### Why `P` must differ from the DNS64 prefix
@@ -124,6 +134,7 @@ The plugin is a CNI 1.0 chained plugin. It must run after `cilium-cni` and needs
       "clatPrefix": "64:ff9b:1::/96",
       "podIPv4": "192.0.0.2/29",
       "gatewayIPv4": "192.0.0.1",
+      "errorSourceIPv4": "192.0.0.8",
       "excludeNamespaces": ["kube-system"],
       "logFile": "/var/log/cilium-clat.log"
     }
@@ -136,8 +147,10 @@ The plugin is a CNI 1.0 chained plugin. It must run after `cilium-cni` and needs
 | `clatPrefix` | IPv6 /96 | required | Prefix `P` for destination mapping |
 | `podIPv4` | IPv4 CIDR | `192.0.0.2/29` | Address set on pod `eth0` |
 | `gatewayIPv4` | IPv4 | `192.0.0.1` | Next hop for the IPv4 default route |
+| `errorSourceIPv4` | IPv4 | `192.0.0.8` | Source of ICMPv4 errors translated from router ICMPv6 errors |
 | `excludeNamespaces` | list | `[]` | Namespaces that get no CLAT (from `K8S_POD_NAMESPACE` in `CNI_ARGS`) |
-| `logFile` | path | none | Plugin log. The plugin never writes to stdout except the result. |
+| `logFile` | path | none | Plugin log. The plugin never writes to stdout except the result. If the file cannot be opened the log goes to stderr. |
+| `failOpen` | bool | `false` | Return the result without a CLAT when setup fails, instead of failing ADD |
 
 ### ADD
 
@@ -145,7 +158,7 @@ The plugin is a CNI 1.0 chained plugin. It must run after `cilium-cni` and needs
    - The pod has no IPv6 address.
    - The pod already has an IPv4 address (dual-stack).
    - The namespace is excluded.
-2. Find the host-side peer of `eth0` from its link index. Read the peer MAC in the host netns.
+2. Find the host-side peer of `eth0` from its link index (`IFLA_LINK`, an index in the host netns). Read the peer MAC in the host netns. Fall back to the host interface MAC that `cilium-cni` reports in `prevResult`.
 3. Enter the pod netns and apply:
 
    ```sh
@@ -174,7 +187,7 @@ CHECK verifies the address, default route, neighbour entry, and both filters wit
 
 ## eBPF program design
 
-Two stateless programs translate per RFC 7915. The reference implementation to port is the CLAT BPF program in NetworkManager 1.58, because it already handles fragments and ICMP error payloads. Android `clatd.c` is simpler, but it relies on a userspace fallback that this design does not have.
+Two stateless programs translate per RFC 7915. *(implementation note)* They are written from the RFC and the kernel helper semantics, not ported from NetworkManager or Android `clatd`, so no licence question arises. Android `clatd` relies on a userspace fallback that this design does not have; the cases it punts on (fragments, ICMP errors, zero UDP checksums) are handled in BPF here.
 
 ### Per-pod constants
 
@@ -195,7 +208,8 @@ volatile const __be32          pod_ip4;       /* 192.0.0.2 */
 | Flow label | 0 | Ignore |
 | TTL / hop limit | Copy, no decrement | Copy, no decrement |
 | Protocol / next header | ICMP 1 becomes 58 | 58 becomes 1 |
-| IPv4 options | Drop packets with source-route options, else ignore | Not applicable |
+| IPv4 options | Drop packets with a source-route option, strip all others (RFC 7915 4.1) | Not applicable |
+| IPv4 multicast, limited broadcast | Drop (no RFC 6052 mapping; mDNS, SSDP, DHCP noise) | Not applicable |
 | IPv6 extension headers | Not applicable | Fragment header only. Drop others. |
 | IPv4 header checksum | Not applicable | Compute |
 | Ethernet type | Rewrite `h_proto` | Rewrite `h_proto` |
@@ -204,19 +218,21 @@ The CLAT is local to the host, so it does not decrement TTL. Cilium does its own
 
 ### Checksums
 
-- **TCP and UDP.** Only the pseudo-header changes. Update with `bpf_l4_csum_replace(..., BPF_F_PSEUDO_HDR)` per changed address word. This is correct for `CHECKSUM_PARTIAL`, which is the normal case on veth egress: the field holds only the pseudo-header sum.
-- **UDP with checksum 0.** Zero is illegal in IPv6. Compute the full checksum on egress. Drop fragmented zero-checksum UDP, because the whole datagram is not available.
+- **TCP and UDP.** Only the pseudo-header changes. Compute the address difference with `bpf_csum_diff` and apply it with `bpf_l4_csum_replace(..., BPF_F_PSEUDO_HDR)`. The kernel then does the right thing for every `ip_summed` state: `CHECKSUM_PARTIAL` (the normal case on veth egress: the field holds only the pseudo-header sum), `CHECKSUM_NONE`, `CHECKSUM_UNNECESSARY` and `CHECKSUM_COMPLETE`.
+- **`CHECKSUM_COMPLETE` bookkeeping** *(implementation note)*. Every header store uses `BPF_F_RECOMPUTE_CSUM` so `skb->csum` follows the bytes, and the difference handed to `bpf_l4_csum_replace` always includes the in-packet bytes that changed (ICMP type, embedded header) plus the pseudo-header delta. The MAC header is outside `skb->csum` coverage, so the `h_proto` rewrite must not recompute. `bpf_skb_adjust_room` gets `BPF_F_ADJ_ROOM_NO_CSUM_RESET`, since the NIC's verdict stays valid once the L4 field is patched.
+- **UDP with checksum 0.** Zero is illegal in IPv6. *(implementation note)* BPF cannot see `ip_summed`, and one `CHECKSUM_PARTIAL` datagram in 65536 also has a zero field (its pseudo-header sum folds to zero, deterministically per destination and length). The program recomputes the IPv4 pseudo-header sum: if it folds to zero the field is treated as partial and updated normally; otherwise the datagram really has no checksum (`SO_NO_CHECK`) and a full checksum is computed over the payload (bounded loop, up to 10240 bytes). Fragmented zero-checksum UDP is dropped, because the whole datagram is not available. The kernel rejects `SO_NO_CHECK` with UDP GSO, so the full computation never meets a GSO skb. A zero UDP checksum on ingress is dropped (RFC 7915 5.5).
 - **ICMP.** ICMPv6 includes a pseudo-header and ICMPv4 does not. Apply the type change and the pseudo-header difference with `bpf_csum_diff`.
 
 ### Offloads
 
-`bpf_skb_change_proto` converts the TCP GSO type and adjusts `gso_size` by the 20-byte header difference. Other GSO types can be refused by the helper. The program drops refused packets and counts them. Confirm UDP GSO behaviour on the Talos kernel before release.
+*(implementation note)* Since Linux 5.14 `bpf_skb_change_proto` only flips `SKB_GSO_TCPV4` to `SKB_GSO_TCPV6` and marks the skb dodgy; it no longer touches `gso_size` and no longer refuses UDP GSO. That is the wanted behaviour: `gso_size` is the L4 payload per segment and must not change when the L3 header grows, and the route MTU of `MTU - 20` already keeps segments within the link MTU. The `bpf_skb_adjust_room` calls (option stripping, Fragment header) pass `BPF_F_ADJ_ROOM_FIXED_GSO` for the same reason. Helper failures are dropped and counted (`*_drop_helper`).
 
 ### Fragments
 
 - Egress: an IPv4 fragment (MF set or offset not 0) gets an IPv6 Fragment header. Identification is the IPv4 ID, zero-extended. Only the first fragment carries the L4 header for checksum update.
 - Ingress: a Fragment header becomes IPv4 MF and offset. Set DF to 0.
 - Unfragmented egress with DF 0 gets no Fragment header.
+- *(implementation note)* **Fragmented ICMP is dropped in both directions.** The ICMPv6 pseudo-header includes the length of the whole ICMPv6 message, which a first fragment does not carry, and a stateless translator has nothing to reassemble with. The same limit applies on the PLAT side unless it is stateful. Test fragments with UDP or TCP, not with `ping -s 3000`.
 
 ### ICMP
 
@@ -226,14 +242,17 @@ The CLAT is local to the host, so it does not decrement TTL. Cilium does its own
 | Packet Too Big 2 | Dest Unreachable 3, code 4, MTU minus 20 |
 | Time Exceeded 3 | Time Exceeded 11 |
 | Dest Unreachable 1, code 4 (port) | Dest Unreachable 3, code 3 |
+| Dest Unreachable 1, codes 1, 5, 6 (admin, policy, reject route) | Dest Unreachable 3, code 10 |
 | Dest Unreachable 1, other codes | Dest Unreachable 3, code 1 |
-| Parameter Problem 4 | Parameter Problem 12, pointer mapped, or drop |
+| Parameter Problem 4, code 0 | Parameter Problem 12, pointer mapped (0, 4, 6, 7, 8, 24), else drop |
+| Parameter Problem 4, code 1 (unknown next header) | Dest Unreachable 3, code 2 |
+| Parameter Problem 4, code 2 | Drop |
 
-For error messages the program also translates the embedded header. The inner IPv6 header shrinks by 20 bytes. The program moves the payload with `bpf_skb_adjust_room` and recomputes the inner and outer checksums. Egress direction handles Echo Request 8 to 128. Egress ICMP errors are rare because the pod accepts no inbound IPv4 flows. Phase 1 drops them.
+For error messages the program also translates the embedded header. The inner IPv6 header shrinks by 20 bytes, or by 28 when it carries a Fragment header, in which case the Packet Too Big MTU is reduced by 28 as well and the inner IPv4 header gets the fragment's identification, offset and MF (RFC 7915 5.2). The program removes the bytes with `bpf_skb_adjust_room` after the outer protocol change, rewrites the outer IPv4 total length, and recomputes the inner transport checksum (when present) and the outer ICMPv4 checksum. An embedded ICMPv6 Echo is translated to ICMPv4 Echo including its checksum, because Linux ping sockets ignore errors that quote any other type. Errors from routers outside `P` are handled as described in [Packet flow](#packet-flow). Egress direction handles Echo Request 8 to 128 and Echo Reply 0 to 129. Egress ICMP errors are rare because the pod accepts no inbound IPv4 flows. Phase 1 drops them.
 
 ### Maps
 
-The programs keep no flow state. One `BPF_MAP_TYPE_PERCPU_ARRAY` holds counters: translated packets per direction, and drops per reason. The plugin pins nothing. Counters are read through `bpftool map dump` in the pod netns, or through the metrics exporter in [Open questions](#open-questions).
+The programs keep no flow state. One `BPF_MAP_TYPE_PERCPU_ARRAY` holds counters: translated packets per direction, and drops per reason. The plugin pins nothing. `cilium-clat counters --netns <path>` reads them through the attached program's map ID; `bpftool map dump` works too.
 
 ## Interaction with Cilium
 
@@ -257,7 +276,7 @@ Phase 1 requires the veth datapath (`bpf.datapathMode=veth`, the default). With 
 
 ### Delivery with `bpf_redirect_peer`
 
-With BPF host routing, Cilium delivers to the pod with `bpf_redirect_peer`. The skb then goes through ingress processing on the peer device again, so `clat_ingress` should run. This is an assumption to verify in the [test plan](#test-and-validation-plan). If it fails, every IPv4 reply is lost, and the pod sees IPv6 packets it does not expect.
+With BPF host routing, Cilium delivers to the pod with `bpf_redirect_peer`. The skb then goes through ingress processing on the peer device again, so `clat_ingress` should run: the receive path re-enters `__netif_receive_skb_core` at `another_round`, and the tc ingress hook sits after that label. This still needs the cluster gate in the [test plan](#test-and-validation-plan). If it fails, every IPv4 reply is lost, and the pod sees IPv6 packets it does not expect.
 
 ## Deployment on Talos
 
@@ -276,8 +295,9 @@ cni:
 
 - `hostNetwork: true`. The installer must not depend on the CNI it installs.
 - Tolerate all taints, including `node.kubernetes.io/not-ready`.
-- An init container copies `cilium-clat` to the host `/opt/cni/bin` through a `hostPath` mount, then the pod sleeps. This is the same mechanism Cilium uses for `cilium-cni`.
-- Copy to a temporary name, then `rename(2)`. The runtime must never execute a partial binary.
+- An init container runs `cilium-clat install --dir /host/opt/cni/bin` against a `hostPath` mount, then the main container runs `cilium-clat sleep`. This is the same mechanism Cilium uses for `cilium-cni`.
+- The binary copies itself to a temporary name, then `rename(2)`. The runtime must never execute a partial binary.
+- The image is built with ko from `cmd/cilium-clat` onto a static base image with no shell, for `linux/amd64` and `linux/arm64`. CI publishes `ghcr.io/andreabedini/cilium-clat`.
 
 ### Boot ordering
 
@@ -302,6 +322,9 @@ Cilium writes the chained conflist before the installer has run. Until the binar
 | BPF load fails (verifier) | ADD fails, pod never starts | CI loads the object on the Talos kernel version. Optional fail-open mode: skip the CLAT and log. |
 | `toFQDNs` policy on a CLAT pod | IPv4 egress denied by policy | CIDR policy on `P` |
 | Sidecar and plugin both active | Two IPv4 default routes, unstable egress | `excludeNamespaces` during migration |
+| Router ICMPv6 error passed through untranslated | PMTUD dead for IPv4, large uploads hang | Translate errors that quote a CLAT flow, source `192.0.0.8` (implemented) |
+| `IP_PMTUDISC_PROBE` socket (`tracepath`) | Probes sent at the device MTU become 20 bytes too long after translation and are dropped at the veth; `tracepath -4` reports `send failed` | Not a CLAT bug. Test PMTUD with `ping -4 -M do` or TCP. |
+| First UDP datagram above the path MTU | Lost until the translated Fragmentation Needed seeds the pod's PMTU cache | Normal PMTUD behaviour; applications retry |
 
 Fail-closed is the default. A pod that asks for IPv4 and silently lacks it is harder to debug than a pod that does not start.
 
@@ -311,22 +334,25 @@ Testing runs in three layers. Each layer must pass before the next starts.
 
 ### 1. Program tests with `BPF_PROG_TEST_RUN`
 
-Feed crafted packets to each program and compare the output bytes. Run on Fedora and on the Talos kernel version.
+Feed crafted packets to each program and compare the output bytes. Run on Fedora and on the Talos kernel version. Implemented in `internal/clat/bpf_test.go`, run as root with `mise run test-bpf`; CI runs it on every push.
 
-- **Differential oracle:** translate the same packets with `jool_siit` in a scratch netns. Jool follows RFC 7915 closely, so any byte difference is a bug in one of the two.
-- Cases: TCP SYN, UDP, UDP with checksum 0, echo request and reply, each ICMP error type with an embedded TCP and UDP header, first and later fragments, IPv4 options, IPv6 extension headers, TTL 1.
-- Checksum cases for `CHECKSUM_PARTIAL`, `CHECKSUM_COMPLETE`, and `CHECKSUM_NONE`. `BPF_PROG_TEST_RUN` does not model all of these, so layer 2 covers the rest.
+- **Oracle:** an independent Go packet builder produces the expected frame for the same flow, and every checksum in the output is recomputed with plain RFC 1071 arithmetic. Byte differences fail the test. `jool_siit` remains an option for a second opinion.
+- Cases: TCP, UDP, UDP with checksum 0, echo request and reply, each ICMPv6 error type with an embedded TCP, UDP and ICMP header, Packet Too Big with and without an inner Fragment header, errors from routers outside `P`, first and later fragments both ways, IPv4 options (strip and source-route drop), IPv6 extension headers, multicast and broadcast, pass-through of native IPv6, DNS64 and NDP traffic, and a full round trip.
+- Checksum cases for `CHECKSUM_PARTIAL`, `CHECKSUM_COMPLETE`, and `CHECKSUM_NONE`. `BPF_PROG_TEST_RUN` only models `CHECKSUM_NONE`, so layer 2 covers `PARTIAL` (veth egress) and a real NIC is needed for `COMPLETE`.
 
 ### 2. Netns integration on Fedora, no Cilium
 
-A veth pair between a "pod" netns and a "node" netns, plus a PLAT netns with `64:ff9b:1::/96`. Run the plugin binary directly with a synthetic `prevResult`.
+A veth pair between a "pod" netns and a "node" netns, plus a "server" netns that owns `64:ff9b:1::198.51.100.10` directly, so no PLAT is needed. The node forwards over a 1280-byte link to force PMTUD. Run the plugin binary directly with a synthetic `prevResult`. Implemented in `hack/netns-test.sh` (`mise run test-netns`); CI runs it on every push.
 
 ```sh
-ip netns exec pod curl -4 http://198.51.100.10/
-ip netns exec pod ping -4 -s 3000 198.51.100.10    # fragments
-ip netns exec pod tracepath -4 198.51.100.10       # PMTUD, PLAT link MTU 1280
-ip netns exec pod iperf3 -4 -c 198.51.100.10 -t 30 # GSO, GRO paths
+ip netns exec pod ping -4 198.51.100.10                    # echo translation
+ip netns exec pod curl -4 http://198.51.100.10:8080/big    # download, GSO/GRO
+ip netns exec pod curl -4 --data-binary @big http://198.51.100.10:8080/upload  # TCP PMTUD pod to server
+ip netns exec pod ping -4 -M do -s 1400 198.51.100.10      # expects "Frag needed and DF set (mtu = 1260)" from 192.0.0.8
+# UDP echo at 10, 1400, 3000 and 9000 bytes, with and without SO_NO_CHECK: fragments both ways
 ```
+
+`tracepath -4` is run for information only: it uses `IP_PMTUDISC_PROBE`, which ignores the route MTU (see [Failure modes](#failure-modes-and-mitigations)). Then CHECK, the counters, DEL, and a second DEL that must also succeed.
 
 ### 3. Cluster tests
 
@@ -352,11 +378,10 @@ ip netns exec pod iperf3 -4 -c 198.51.100.10 -t 30 # GSO, GRO paths
 
 - [ ] Pod IPv6 addressing: are pod addresses routed GUA from `2403:580e:e231::/48`, or masqueraded? This decides whether the PLAT sees one source per pod or per node.
 - [ ] PLAT for `P`: a second tayga instance, or move the router to Jool NAT64 with both prefixes?
-- [ ] License of the NetworkManager CLAT BPF source. Confirm it permits a port into this plugin.
 - [ ] `toFQDNs`: is FQDN policy needed for CLAT pods at all? If yes, investigate a DNS proxy hook that also adds `P::a.b.c.d` for each A record.
-- [ ] Metrics: a small exporter in the installer DaemonSet that walks pod netns and reads the counter maps, or `bpftool` only?
+- [ ] Metrics: a small exporter in the installer DaemonSet that walks pod netns and reads the counter maps (the `counters` subcommand has the code), or `bpftool` only?
 - [ ] Opt-in per pod through an annotation, which needs an API call from the plugin, or namespace exclusion only?
-- [ ] Fail-open mode: keep it at all?
+- [ ] Fail-open mode: implemented as `failOpen`, off by default. Keep it at all?
 
 ## Sources
 
@@ -365,5 +390,6 @@ ip netns exec pod iperf3 -4 -c 198.51.100.10 -t 30 # GSO, GRO paths
 - [RFC 7915: IP/ICMP translation algorithm](https://www.rfc-editor.org/rfc/rfc7915)
 - [RFC 6052: IPv6 addressing of IPv4/IPv6 translators](https://www.rfc-editor.org/rfc/rfc6052)
 - [RFC 7335: IPv4 service continuity prefix](https://www.rfc-editor.org/rfc/rfc7335)
+- [RFC 6791: stateless source address mapping for ICMPv6 packets](https://www.rfc-editor.org/rfc/rfc6791)
 - [RFC 8215: local-use IPv4/IPv6 translation prefix](https://www.rfc-editor.org/rfc/rfc8215)
 - [CNI specification 1.0](https://www.cni.dev/docs/spec/)
