@@ -119,6 +119,38 @@ func TestDecide(t *testing.T) {
 	}
 }
 
+func TestDecideIncludeNamespaces(t *testing.T) {
+	_, cfg, err := ParseConfig([]byte(`{"cniVersion":"1.0.0","name":"x","type":"cilium-clat",
+		"clatPrefix":"64:ff9b:1::/96","includeNamespaces":["openclaw"],"excludeNamespaces":["kube-system","openclaw"]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// exclude wins over include; anything not included is skipped.
+	for ns, want := range map[string]SkipReason{
+		"openclaw":    SkipExcludedNS,
+		"default":     SkipNotIncluded,
+		"kube-system": SkipExcludedNS,
+	} {
+		if _, skip := Decide(cfg, result("2001:db8::2/128"), ns); skip != want {
+			t.Errorf("%s: skip = %q, want %q", ns, skip, want)
+		}
+	}
+	_, cfg, err = ParseConfig([]byte(`{"cniVersion":"1.0.0","name":"x","type":"cilium-clat",
+		"clatPrefix":"64:ff9b:1::/96","includeNamespaces":["openclaw"],"failOpen":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.FailOpen {
+		t.Error("failOpen not parsed")
+	}
+	if _, skip := Decide(cfg, result("2001:db8::2/128"), "openclaw"); skip != SkipNone {
+		t.Errorf("openclaw: skip = %q", skip)
+	}
+	if _, skip := Decide(cfg, result("2001:db8::2/128"), "media"); skip != SkipNotIncluded {
+		t.Errorf("media: skip = %q", skip)
+	}
+}
+
 func TestHostInterfaceMAC(t *testing.T) {
 	conf, _, err := ParseConfig([]byte(baseConf))
 	if err != nil {

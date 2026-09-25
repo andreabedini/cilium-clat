@@ -129,7 +129,7 @@ if [ "$NO_CLAT" -eq 1 ]; then
 	exit 0
 fi
 
-log "CNI ADD"
+log "CNI conf"
 LXC_MAC="$(ip -n node -o link show lxc0 | sed -n 's/.*link\/ether \([0-9a-f:]*\).*/\1/p')"
 POD_MAC="$(ip -n pod -o link show eth0 | sed -n 's/.*link\/ether \([0-9a-f:]*\).*/\1/p')"
 cat >"$WORK/conf.json" <<EOF
@@ -160,6 +160,20 @@ cni() {
 		CNI_ARGS="K8S_POD_NAMESPACE=default;K8S_POD_NAME=test" \
 		"$BIN" <"$WORK/conf.json"
 }
+log "ADD with a sidecar-style IPv4 stack already present must pass through"
+ip -n pod link add clat type dummy
+ip -n pod link set clat up
+ip -n pod addr add 192.0.0.1/32 dev clat
+ip -n pod route add default dev clat metric 2048 mtu 1260
+cni ADD >"$WORK/add-foreign.json" || { cat "$WORK/add-foreign.json"; fail "ADD (foreign)"; }
+grep -q "$POD6" "$WORK/add-foreign.json" || fail "ADD (foreign) must pass prevResult through"
+if ip -n pod addr show eth0 | grep -q 192.0.0.2; then fail "ADD (foreign) must not add our address"; fi
+if ip netns exec pod tc filter show dev eth0 egress 2>/dev/null | grep -q clat; then fail "ADD (foreign) must not attach"; fi
+grep -q 'sidecar' "$WORK/cilium-clat.log" || fail "ADD (foreign) must log the skip"
+cni CHECK || fail "CHECK after a foreign skip must succeed"
+ip -n pod link del clat
+
+log "CNI ADD"
 cni ADD >"$WORK/add.json" || { cat "$WORK/add.json"; echo; cat "$WORK/cilium-clat.log"; fail "ADD"; }
 grep -q "$POD6" "$WORK/add.json" || fail "ADD result must pass prevResult through"
 grep -q '192.0.0.2' "$WORK/add.json" && fail "ADD result must not contain the IPv4 address"

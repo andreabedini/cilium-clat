@@ -1,5 +1,13 @@
 # Chained conflist. Cilium copies it to /etc/cni/net.d/05-cilium.conflist
-# when cni.customConf=true and cni.configMap=cni-configuration.
+# when cni.customConf=true and cni.configMap=cni-configuration. Cilium reads
+# the ConfigMap at agent start: restart the agent after changing it.
+#
+# Do not install this before the router serves the CLAT prefix (clatPrefix)
+# with a NAT64: see README, "Deploy".
+#
+# This is the trial shape: only the listed namespaces get a CLAT, and any
+# setup failure lets the pod start without one (logged in logFile). For the
+# general rollout drop includeNamespaces and failOpen.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -21,7 +29,10 @@ data:
           "clatPrefix": "64:ff9b:1::/96",
           "podIPv4": "192.0.0.2/29",
           "gatewayIPv4": "192.0.0.1",
+          "errorSourceIPv4": "192.0.0.8",
+          "includeNamespaces": ["openclaw"],
           "excludeNamespaces": ["kube-system"],
+          "failOpen": true,
           "logFile": "/var/log/cilium-clat.log"
         }
       ]

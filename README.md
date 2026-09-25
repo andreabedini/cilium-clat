@@ -51,18 +51,95 @@ and `sha-<commit>`; tags `v*` publish the version. The image is built with
 [ko](https://ko.build) from `cmd/cilium-clat` onto a static base with no
 shell.
 
+## Configuration
+
+The plugin's entry in the conflist. Only `clatPrefix` is required.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `clatPrefix` | required | IPv6 /96 the PLAT serves; IPv4 destinations map into it (RFC 6052) |
+| `podIPv4` | `192.0.0.2/29` | Address on the pod interface, same in every pod (RFC 7335) |
+| `gatewayIPv4` | `192.0.0.1` | Next hop of the IPv4 default route; a permanent neighbour entry points it at the host-side veth MAC |
+| `errorSourceIPv4` | `192.0.0.8` | Source of ICMPv4 errors translated from router ICMPv6 errors (RFC 7335 dummy address) |
+| `includeNamespaces` | `[]` (all) | When non-empty, only pods in these namespaces get a CLAT |
+| `excludeNamespaces` | `[]` | Namespaces that never get a CLAT; wins over `includeNamespaces` |
+| `failOpen` | `false` | On any setup error: log, undo partial state, start the pod without a CLAT. Default is fail-closed: the pod does not start |
+| `logFile` | none | Plugin log; stderr if the file cannot be opened. Stdout carries only the CNI result |
+
+A pod also gets no CLAT, and the result passes through untouched, when it
+has no IPv6 address, already has an IPv4 address in the result (dual-stack),
+or its netns already holds IPv4 state the plugin did not create (an address
+on any interface, or an IPv4 default route). That last check is what keeps
+the plugin away from pods that run a CLAT sidecar. Every skip is logged with
+its reason. CHECK follows the same decisions and does not fail a pod that
+was skipped or that started without a CLAT under `failOpen`.
+
 ## Deploy
 
-1. `kubectl apply -f deploy/cni-configuration.yaml`
+### 1. Make the router serve the CLAT prefix first
+
+Every IPv4 packet a pod sends leaves the node as IPv6 to
+`clatPrefix::a.b.c.d`. Nothing answers those until a NAT64 (the PLAT) on the
+router serves that prefix. Install the conflist only after that is in place,
+or every IPv4 connection from a CLAT pod fails.
+
+`clatPrefix` is fully configurable; it must be a /96 with the low 32 bits
+zero and must not overlap the DNS64 prefix (`64:ff9b::/96` when DNS64 is
+in the cluster). The default `64:ff9b:1::/96` comes from the RFC 8215
+local-use range.
+
+Pool pressure: a stateless-mapping NAT64 such as tayga gives one IPv4 pool
+address to each IPv6 source it sees, and the source is the pod's own IPv6
+address, so every CLAT pod that ever speaks IPv4 holds one pool entry until
+it expires. Size the pool for the number of CLAT pods plus churn, or use a
+stateful NAT64 (Jool) that masquerades everything behind one IPv4 address.
+A trial limited to a few namespaces is fine with a second tayga instance
+and a small pool; a cluster-wide rollout is better served by Jool NAT64
+serving both prefixes, which also reassembles fragments. Cilium IPv6
+masquerade toward the prefix would make the PLAT see one source per node,
+but it changes the addressing of every other flow and is not worth it on a
+cluster that routes pod IPv6 addresses natively.
+
+### 2. Install
+
+1. `kubectl apply -f deploy/cni-configuration.yaml`. The committed file is
+   the trial shape: `includeNamespaces` limited to one namespace and
+   `failOpen: true`. For the general rollout drop both keys.
 2. Merge `deploy/cilium-values.yaml` into the Cilium Helm values and upgrade.
-   Cilium writes the chained conflist to `/etc/cni/net.d`.
+   Cilium writes the chained conflist to `/etc/cni/net.d`. Cilium reads the
+   ConfigMap at agent start, so a later change to it needs an agent restart.
 3. `kubectl apply -f deploy/installer.yaml`. The init container runs
    `cilium-clat install`, which copies the binary into `/opt/cni/bin` on the
    host through a temporary name and a rename. The main container runs
    `cilium-clat sleep`.
-4. Restart the workloads that need IPv4.
+4. Restart the workloads that should get IPv4. Only new sandboxes go
+   through ADD.
 
-`excludeNamespaces` keeps namespaces that still run a CLAT sidecar out.
+Until the installer has run on a node, every sandbox ADD on that node fails
+because the conflist names a plugin that is not there yet. On a single-node
+cluster this hits every pod after a reboot if `/opt/cni/bin` does not
+persist; the installer DaemonSet is `system-node-critical` and tolerates
+every taint so it runs first, but measure the delay.
+
+### 3. Sidecars
+
+A CLAT sidecar (tayga, clatd, clatto) owns a tun device with `192.0.0.1/32`
+and an IPv4 default route with a high metric, plus policy rules for the
+DNS64 prefix. The plugin and a sidecar must never share a pod: `192.0.0.1`
+is the plugin's gateway and the sidecar's own address, and two IPv4 default
+routes make egress depend on metrics. Keep sidecar namespaces out of
+`includeNamespaces` (or in `excludeNamespaces`). The ADD-time check above
+is the second line of defence: it skips any pod whose netns already has
+IPv4 state. Note that at CNI ADD time no container has started yet, so the
+check catches an earlier plugin in the chain or a retried ADD, not a
+sidecar that starts later; the namespace lists are what keep sidecars out.
+
+If a sidecar is nevertheless started after the plugin ran, nothing breaks
+at the packet level: the plugin's default route has metric 0 and wins, so
+IPv4 leaves through the CLAT; the sidecar's rules only match the DNS64
+prefix, which the plugin never touches; the BPF programs run before policy
+routing and do not depend on rule order. The sidecar simply carries no
+traffic. Remove it and restart the pod rather than run both.
 
 ## Debugging
 

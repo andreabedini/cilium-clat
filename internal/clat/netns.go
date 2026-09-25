@@ -179,3 +179,80 @@ func CheckIPv4(link netlink.Link, s IPv4Setup) error {
 	}
 	return nil
 }
+
+// IPv4State classifies the IPv4 configuration found in a pod netns.
+type IPv4State int
+
+const (
+	// IPv4None: no IPv4 address (besides loopback) and no IPv4 default route.
+	IPv4None IPv4State = iota
+	// IPv4Ours: only what ConfigureIPv4 installs on the pod interface.
+	IPv4Ours
+	// IPv4Foreign: an IPv4 address or default route that is not ours, for
+	// example a CLAT sidecar's tun device with 192.0.0.1/32 and its default
+	// route. The plugin must not add a second IPv4 stack next to it.
+	IPv4Foreign
+)
+
+func (st IPv4State) String() string {
+	switch st {
+	case IPv4None:
+		return "none"
+	case IPv4Ours:
+		return "ours"
+	}
+	return "foreign"
+}
+
+// InspectIPv4 looks at every link in the current netns and reports whether
+// the IPv4 state is empty, exactly ours, or something else. Must run inside
+// the pod netns.
+func InspectIPv4(ifName string, s IPv4Setup) (IPv4State, error) {
+	links, err := netlink.LinkList()
+	if err != nil {
+		return IPv4Foreign, fmt.Errorf("list links: %w", err)
+	}
+	ours, foreign := false, false
+	want := ipNet(s.PodIPv4).String()
+	for _, l := range links {
+		if l.Attrs().Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := netlink.AddrList(l, unix.AF_INET)
+		if err != nil {
+			return IPv4Foreign, fmt.Errorf("list addresses on %s: %w", l.Attrs().Name, err)
+		}
+		for _, a := range addrs {
+			if a.IPNet == nil {
+				continue
+			}
+			if l.Attrs().Name == ifName && a.IPNet.String() == want {
+				ours = true
+				continue
+			}
+			foreign = true
+		}
+	}
+	routes, err := netlink.RouteListFiltered(unix.AF_INET, &netlink.Route{Table: unix.RT_TABLE_MAIN}, netlink.RT_FILTER_TABLE)
+	if err != nil {
+		return IPv4Foreign, fmt.Errorf("list routes: %w", err)
+	}
+	for _, r := range routes {
+		if r.Dst != nil && !r.Dst.IP.Equal(net.IPv4zero) {
+			continue // not a default route
+		}
+		link, err := netlink.LinkByIndex(r.LinkIndex)
+		if err == nil && link.Attrs().Name == ifName && r.Gw.Equal(s.Gateway.AsSlice()) {
+			ours = true
+			continue
+		}
+		foreign = true
+	}
+	switch {
+	case foreign:
+		return IPv4Foreign, nil
+	case ours:
+		return IPv4Ours, nil
+	}
+	return IPv4None, nil
+}

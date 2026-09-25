@@ -25,10 +25,13 @@ const (
 type NetConf struct {
 	types.PluginConf
 
-	ClatPrefix        string   `json:"clatPrefix"`
-	PodIPv4           string   `json:"podIPv4,omitempty"`
-	GatewayIPv4       string   `json:"gatewayIPv4,omitempty"`
-	ErrorSourceIPv4   string   `json:"errorSourceIPv4,omitempty"`
+	ClatPrefix      string `json:"clatPrefix"`
+	PodIPv4         string `json:"podIPv4,omitempty"`
+	GatewayIPv4     string `json:"gatewayIPv4,omitempty"`
+	ErrorSourceIPv4 string `json:"errorSourceIPv4,omitempty"`
+	// IncludeNamespaces, when non-empty, is an allow-list: only pods in
+	// these namespaces get a CLAT. ExcludeNamespaces still applies.
+	IncludeNamespaces []string `json:"includeNamespaces,omitempty"`
 	ExcludeNamespaces []string `json:"excludeNamespaces,omitempty"`
 	LogFile           string   `json:"logFile,omitempty"`
 	// FailOpen makes ADD succeed without a CLAT when the CLAT setup fails.
@@ -41,7 +44,8 @@ type Config struct {
 	Prefix            netip.Prefix // CLAT prefix P, always /96
 	PodIPv4           netip.Prefix // address and mask for the pod interface
 	Gateway           netip.Addr
-	ErrorSource       netip.Addr // source of translated router ICMP errors
+	ErrorSource       netip.Addr          // source of translated router ICMP errors
+	IncludeNamespaces map[string]struct{} // empty means all namespaces
 	ExcludeNamespaces map[string]struct{}
 	LogFile           string
 	FailOpen          bool
@@ -58,6 +62,7 @@ func ParseConfig(stdin []byte) (*NetConf, *Config, error) {
 	}
 
 	cfg := &Config{
+		IncludeNamespaces: map[string]struct{}{},
 		ExcludeNamespaces: map[string]struct{}{},
 		LogFile:           conf.LogFile,
 		FailOpen:          conf.FailOpen,
@@ -120,6 +125,9 @@ func ParseConfig(stdin []byte) (*NetConf, *Config, error) {
 	}
 	cfg.ErrorSource = ea
 
+	for _, ns := range conf.IncludeNamespaces {
+		cfg.IncludeNamespaces[ns] = struct{}{}
+	}
 	for _, ns := range conf.ExcludeNamespaces {
 		cfg.ExcludeNamespaces[ns] = struct{}{}
 	}
@@ -145,6 +153,8 @@ const (
 	SkipNoIPv6       SkipReason = "pod has no IPv6 address"
 	SkipHasIPv4      SkipReason = "pod already has an IPv4 address"
 	SkipExcludedNS   SkipReason = "namespace is excluded"
+	SkipNotIncluded  SkipReason = "namespace is not in includeNamespaces"
+	SkipForeignIPv4  SkipReason = "pod netns already has IPv4 state from something else (sidecar?)"
 	SkipNoInterface  SkipReason = "prevResult has no sandbox interface"
 	SkipNoPrevResult SkipReason = "no prevResult"
 )
@@ -157,6 +167,11 @@ func Decide(cfg *Config, res *current.Result, namespace string) (netip.Addr, Ski
 	}
 	if _, excluded := cfg.ExcludeNamespaces[namespace]; excluded {
 		return netip.Addr{}, SkipExcludedNS
+	}
+	if len(cfg.IncludeNamespaces) > 0 {
+		if _, included := cfg.IncludeNamespaces[namespace]; !included {
+			return netip.Addr{}, SkipNotIncluded
+		}
 	}
 	var pod6 netip.Addr
 	for _, ip := range res.IPs {

@@ -148,7 +148,8 @@ The plugin is a CNI 1.0 chained plugin. It must run after `cilium-cni` and needs
 | `podIPv4` | IPv4 CIDR | `192.0.0.2/29` | Address set on pod `eth0` |
 | `gatewayIPv4` | IPv4 | `192.0.0.1` | Next hop for the IPv4 default route |
 | `errorSourceIPv4` | IPv4 | `192.0.0.8` | Source of ICMPv4 errors translated from router ICMPv6 errors |
-| `excludeNamespaces` | list | `[]` | Namespaces that get no CLAT (from `K8S_POD_NAMESPACE` in `CNI_ARGS`) |
+| `includeNamespaces` | list | `[]` (all) | *(implementation note)* When non-empty, only these namespaces get a CLAT. Opt-in for a staged rollout. |
+| `excludeNamespaces` | list | `[]` | Namespaces that get no CLAT (from `K8S_POD_NAMESPACE` in `CNI_ARGS`). Wins over `includeNamespaces`. |
 | `logFile` | path | none | Plugin log. The plugin never writes to stdout except the result. If the file cannot be opened the log goes to stderr. |
 | `failOpen` | bool | `false` | Return the result without a CLAT when setup fails, instead of failing ADD |
 
@@ -157,7 +158,8 @@ The plugin is a CNI 1.0 chained plugin. It must run after `cilium-cni` and needs
 1. Parse `prevResult`. Stop and pass it through unchanged if any condition is true:
    - The pod has no IPv6 address.
    - The pod already has an IPv4 address (dual-stack).
-   - The namespace is excluded.
+   - The namespace is excluded, or `includeNamespaces` is set and does not list it.
+   - *(implementation note)* The pod netns already holds IPv4 state the plugin did not create: an IPv4 address on any interface, or an IPv4 default route. This keeps the plugin off pods with a CLAT sidecar or another IPv4 plugin. Our own state from a retried ADD is recognised and the setup proceeds, since every step is idempotent.
 2. Find the host-side peer of `eth0` from its link index (`IFLA_LINK`, an index in the host netns). Read the peer MAC in the host netns. Fall back to the host interface MAC that `cilium-cni` reports in `prevResult`.
 3. Enter the pod netns and apply:
 
@@ -305,9 +307,12 @@ Cilium writes the chained conflist before the installer has run. Until the binar
 
 ### Migration from sidecars
 
-1. Deploy with `excludeNamespaces` listing every namespace that still runs sidecars. A sidecar and the plugin would both install an IPv4 default route.
-2. For each namespace: remove the sidecar, remove the namespace from `excludeNamespaces`, restart the workloads.
-3. Delete the sidecar image and its `NET_ADMIN` grants.
+1. Deploy with `includeNamespaces` listing the trial namespaces and `failOpen: true`, and `excludeNamespaces` listing every namespace that still runs sidecars. A sidecar and the plugin would both install an IPv4 default route, and `192.0.0.1` is the plugin's gateway but the sidecar's own tun address: they must never share a pod.
+2. For each namespace: remove the sidecar, add the namespace to `includeNamespaces` (or drop the key once every sidecar is gone), restart the Cilium agent so it rewrites the conflist, restart the workloads.
+3. Drop `failOpen` once the datapath has proven itself under Cilium.
+4. Delete the sidecar image and its `NET_ADMIN` grants.
+
+*(implementation note)* The sidecars in use (tayga, clatto) own a tun device `clat` with `192.0.0.1/32`, an IPv4 default route with metric 2048 and MTU 1260, and reorder the IPv6 policy rules: `local` moves to priority 2 behind a priority-1 rule for `64:ff9b::/96` traffic to the pod address. None of that interacts with the plugin's programs: they run on `eth0` before policy routing, match only the CLAT prefix and router errors that quote it, and never see the DNS64 prefix. If a sidecar starts after the plugin ran, the plugin's metric-0 default route wins and the sidecar carries nothing. The ADD-time IPv4 check cannot see a sidecar, because at CNI ADD no container has started yet; the namespace lists are the real guard.
 
 ## Failure modes and mitigations
 
@@ -325,8 +330,10 @@ Cilium writes the chained conflist before the installer has run. Until the binar
 | Router ICMPv6 error passed through untranslated | PMTUD dead for IPv4, large uploads hang | Translate errors that quote a CLAT flow, source `192.0.0.8` (implemented) |
 | `IP_PMTUDISC_PROBE` socket (`tracepath`) | Probes sent at the device MTU become 20 bytes too long after translation and are dropped at the veth; `tracepath -4` reports `send failed` | Not a CLAT bug. Test PMTUD with `ping -4 -M do` or TCP. |
 | First UDP datagram above the path MTU | Lost until the translated Fragmentation Needed seeds the pod's PMTU cache | Normal PMTUD behaviour; applications retry |
+| Conflist installed before the PLAT serves `P` | Every IPv4 connection from a CLAT pod fails | Router work first; `includeNamespaces` keeps the blast radius small |
+| Sidecar and plugin in one pod | `192.0.0.1` is both the gateway and the sidecar's address; two default routes | Namespace lists; ADD skips pods with foreign IPv4 state |
 
-Fail-closed is the default. A pod that asks for IPv4 and silently lacks it is harder to debug than a pod that does not start.
+Fail-closed is the default. A pod that asks for IPv4 and silently lacks it is harder to debug than a pod that does not start. *(implementation note)* `failOpen: true` exists for staged rollouts: on any error (netns inspection, BPF load or verifier, address, route, neighbour, qdisc or filter) the plugin logs the error with the full verifier output, removes whatever it had already installed, and returns `prevResult` unchanged. CHECK then treats a pod with no CLAT state as skipped rather than broken.
 
 ## Test and validation plan
 

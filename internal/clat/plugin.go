@@ -97,16 +97,41 @@ func CmdAdd(args *skel.CmdArgs) error {
 		return types.PrintResult(res, conf.CNIVersion)
 	}
 
+	// Never add a second IPv4 stack next to one that something else owns
+	// (a CLAT sidecar, another chained plugin). A re-ADD after a partial
+	// failure finds our own state and proceeds: setup is idempotent.
+	setup := IPv4Setup{PodIPv4: cfg.PodIPv4, Gateway: cfg.Gateway}
+	var state IPv4State
+	err = ns.WithNetNSPath(args.Netns, func(ns.NetNS) error {
+		var err error
+		state, err = InspectIPv4(args.IfName, setup)
+		return err
+	})
+	if err != nil {
+		return failOrOpen(cfg, conf, res, logger, args, namespace, fmt.Errorf("inspect pod netns: %w", err))
+	}
+	if state == IPv4Foreign {
+		logger.Printf("ADD %s ns=%s: skip: %s", args.ContainerID, namespace, SkipForeignIPv4)
+		return types.PrintResult(res, conf.CNIVersion)
+	}
+
 	if err := install(args, cfg, res, pod6, logger); err != nil {
-		// %+v expands a verifier log in full; the log file is the place for it.
-		logger.Printf("ADD %s ns=%s: CLAT setup failed (fail-open=%v): %+v", args.ContainerID, namespace, cfg.FailOpen, err)
-		if cfg.FailOpen {
-			return types.PrintResult(res, conf.CNIVersion)
-		}
-		return fmt.Errorf("cilium-clat: %v", err)
+		return failOrOpen(cfg, conf, res, logger, args, namespace, err)
 	}
 	logger.Printf("ADD %s ns=%s: CLAT installed, pod %s, prefix %s", args.ContainerID, namespace, pod6, cfg.Prefix)
 	return types.PrintResult(res, conf.CNIVersion)
+}
+
+// failOrOpen is the fail-open switch. Partial state has already been undone
+// by the caller; with failOpen the pod starts without a CLAT and the reason is
+// in the log, otherwise ADD fails and the pod does not start.
+func failOrOpen(cfg *Config, conf *NetConf, res *current.Result, logger *log.Logger, args *skel.CmdArgs, namespace string, err error) error {
+	// %+v expands a verifier log in full; the log file is the place for it.
+	logger.Printf("ADD %s ns=%s: CLAT setup failed (fail-open=%v): %+v", args.ContainerID, namespace, cfg.FailOpen, err)
+	if cfg.FailOpen {
+		return types.PrintResult(res, conf.CNIVersion)
+	}
+	return fmt.Errorf("cilium-clat: %v", err)
 }
 
 func install(args *skel.CmdArgs, cfg *Config, res *current.Result, pod6 netip.Addr, logger *log.Logger) error {
@@ -204,6 +229,36 @@ func CmdCheck(args *skel.CmdArgs) error {
 		return nil
 	}
 
+	// Mirror ADD's decisions: a pod skipped for foreign IPv4 state, or
+	// started without a CLAT under failOpen, is not a CHECK failure.
+	setup := IPv4Setup{PodIPv4: cfg.PodIPv4, Gateway: cfg.Gateway}
+	var state IPv4State
+	var filters map[string]*netlink.BpfFilter
+	err = ns.WithNetNSPath(args.Netns, func(ns.NetNS) error {
+		var err error
+		if state, err = InspectIPv4(args.IfName, setup); err != nil {
+			return err
+		}
+		link, err := netlink.LinkByName(args.IfName)
+		if err != nil {
+			return err
+		}
+		filters, err = AttachedFilters(link)
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	if state == IPv4Foreign {
+		return nil
+	}
+	if state == IPv4None && len(filters) == 0 {
+		if cfg.FailOpen {
+			return nil
+		}
+		return fmt.Errorf("no CLAT state in %s: IPv4 address, routes and filters are all missing", args.Netns)
+	}
+
 	pl, err := inspectPodLink(args.Netns, args.IfName)
 	if err != nil {
 		return err
@@ -222,7 +277,7 @@ func CmdCheck(args *skel.CmdArgs) error {
 		return err
 	}
 
-	setup := IPv4Setup{PodIPv4: cfg.PodIPv4, Gateway: cfg.Gateway, PeerMAC: peer}
+	setup.PeerMAC = peer
 	return ns.WithNetNSPath(args.Netns, func(ns.NetNS) error {
 		link, err := netlink.LinkByName(args.IfName)
 		if err != nil {
